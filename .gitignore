@@ -6,3 +6,7 @@
 /__pychache__
 /moco/__pychache__
 
+wandb/
+__pycache__/
+.ipynb_checkpoints/
+*.tar

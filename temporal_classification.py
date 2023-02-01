@@ -4,6 +4,8 @@ import random
 import shutil
 import time
 import warnings
+from datetime import datetime
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -19,23 +21,27 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 from utils import GaussianBlur
 
+import numpy as np
+
+import wandb
 
 parser = argparse.ArgumentParser(description='Temporal classification with headcam data')
-parser.add_argument('data', metavar='DIR', help='path to dataset')
+parser.add_argument('--data', help='path to dataset')
+parser.add_argument('--val-data', help='path to validation dataset')
 parser.add_argument('--model', default='resnet50', choices=['resnet50', 'resnext101_32x8d', 'resnext50_32x4d',
                                                             'mobilenet_v2'], help='model')
-parser.add_argument('-j', '--workers', default=32, type=int, metavar='N', help='number of data loading workers (default'
+parser.add_argument('-j', '--workers', default=16, type=int, metavar='N', help='number of data loading workers (default'
                                                                                ':16)')
-parser.add_argument('--epochs', default=16, type=int, metavar='N', help='number of total epochs to run')
+parser.add_argument('--epochs', default=50, type=int, metavar='N', help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N', help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=256, type=int, metavar='N',
-                    help='mini-batch size (default: 128), this is the total batch size of all GPUs on the current node '
+parser.add_argument('-b', '--batch-size', default=64, type=int, metavar='N',
+                    help='mini-batch size (default: 64), this is the total batch size of all GPUs on the current node '
                          'when using Data Parallel or Distributed Data Parallel')
-parser.add_argument('--lr', '--learning-rate', default=0.0005, type=float, metavar='LR', help='initial learning rate',
+parser.add_argument('--lr', '--learning-rate', default=0.0001, type=float, metavar='LR', help='initial learning rate',
                     dest='lr')
 parser.add_argument('--wd', '--weight-decay', default=0.0, type=float, metavar='W', help='weight decay (default: 0)',
                     dest='weight_decay')
-parser.add_argument('-p', '--print-freq', default=10000, type=int, metavar='N', help='print frequency (default: 250)')
+parser.add_argument('-p', '--print-freq', default=1000, type=int, metavar='N', help='print frequency (default: 1000)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH', help='path to latest checkpoint (default: none)')
 parser.add_argument('--world-size', default=-1, type=int, help='number of nodes for distributed training')
 parser.add_argument('--rank', default=-1, type=int, help='node rank for distributed training')
@@ -46,16 +52,21 @@ parser.add_argument('--gpu', default=None, type=int, help='GPU id to use.')
 parser.add_argument('--multiprocessing-distributed', action='store_true',
                     help='Use multi-processing distributed training to launch '
                          'N processes per node, which has N GPUs. This is the '
-                         'fastest way to use PyTorch for either single node or '
+                         'fastest way to use tePyTorch for either single node or '
                          'multi node data parallel training')
 parser.add_argument('--n_out', default=1000, type=int, help='output dim')
 parser.add_argument('--augmentation', default=True, action='store_false', help='whether to use data augmentation?')
+parser.add_argument('--partition', default='SAY', type=str, help='which partition to process. Choices: [S, A, Y, SAY]')
 
+SEG_LEN = 288
+FPS = 5
 
 def main():
     args = parser.parse_args()
 
     print(args)
+    wandb.init(project="baby-vision", entity="yanlaiy")
+    wandb.config = args
 
     if args.gpu is not None:
         warnings.warn('You have chosen a specific GPU. This will completely disable data parallelism.')
@@ -106,7 +117,12 @@ def main_worker(gpu, ngpus_per_node, args):
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
 
-    savefile_name = args.model + '_augmentstrong_batch256_' + str(args.augmentation) + '_Y_5_288'
+    date_time = datetime.now().strftime("%m%d%Y_%H%M%S")
+    
+    exp_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'experiments')
+    savefile_dir = f'{args.model}_{args.batch_size}_{args.augmentation}_{args.partition}_{FPS}_{SEG_LEN}_{date_time}'
+    exp_path = os.path.join(exp_path, savefile_dir)
+    Path(exp_path).mkdir(parents=True, exist_ok=True)
 
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
@@ -132,42 +148,43 @@ def main_worker(gpu, ngpus_per_node, args):
             ])
         )
 
+    val_dataset = datasets.ImageFolder(
+        args.val_data,
+        transforms.Compose([
+            transforms.ToTensor(),
+            normalize
+        ])
+    )
+
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=args.workers, pin_memory=True, sampler=None
     )
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=args.batch_size,
+        num_workers=args.workers, pin_memory=True, sampler=None
+    )
 
-    acc1_list = []
+    step = 0
 
     for epoch in range(args.start_epoch, args.epochs):
-
+        
+        val(val_loader, model, criterion, step, args)
         # train for one epoch
-        acc1 = train(train_loader, model, criterion, optimizer, epoch, args)
-        acc1_list.append(acc1)
+        step = train(train_loader, model, criterion, optimizer, epoch, args)
 
-        torch.save({'acc1_list': acc1_list,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict()}, savefile_name + '_epoch_' + str(epoch) + '.tar')
+        torch.save({'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict()}, 
+                    os.path.join(exp_path, f'epoch_{epoch}.tar'))
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
-    batch_time = AverageMeter('Time', ':6.3f')
-    data_time = AverageMeter('Data', ':6.3f')
-    losses = AverageMeter('Loss', ':.4e')
-    top1 = AverageMeter('Acc@1', ':6.2f')
-    top5 = AverageMeter('Acc@5', ':6.2f')
-    progress = ProgressMeter(
-        len(train_loader),
-        [batch_time, data_time, losses, top1, top5],
-        prefix="Epoch: [{}]".format(epoch))
-
     # switch to train mode
     model.train()
 
-    end = time.time()
+    num_steps = len(train_loader)
     for i, (images, target) in enumerate(train_loader):
-        # measure data loading time
-        data_time.update(time.time() - end)
+        step = epoch * num_steps + i
 
         if args.gpu is not None:
             images = images.cuda(args.gpu, non_blocking=True)
@@ -179,65 +196,51 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), images.size(0))
-        top1.update(acc1[0], images.size(0))
-        top5.update(acc5[0], images.size(0))
+        losses = loss.item()
+        top1 = acc1[0]
+        top5 = acc5[0]
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
+        if step % args.print_freq == 0:
+            wandb.log({'train_loss': losses}, step=step)
+            wandb.log({'train_top1': top1}, step=step)
+            wandb.log({'train_top5': top5}, step=step)
+            print(num_steps)
+            print(losses)
 
-        if i % args.print_freq == 0:
-            progress.display(i)
+    return step
 
-    return top1.avg.cpu().numpy()
+def val(val_loader, model, criterion, step, args):
+    # switch to eval mode
+    model.eval()
 
+    losses = []
+    top1 = []
+    top5 = []
 
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-    def __init__(self, name, fmt=':f'):
-        self.name = name
-        self.fmt = fmt
-        self.reset()
+    for i, (images, target) in enumerate(val_loader):
 
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
+        if args.gpu is not None:
+            images = images.cuda(args.gpu, non_blocking=True)
+        target = target.cuda(args.gpu, non_blocking=True)
 
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
+        # compute output
+        output = model(images)
+        loss = criterion(output, target)
 
-    def __str__(self):
-        fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
-        return fmtstr.format(**self.__dict__)
+        # measure accuracy and record loss
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        losses.append(loss.item())
+        top1.append(acc1[0].cpu())
+        top5.append(acc5[0].cpu())
 
-
-class ProgressMeter(object):
-    def __init__(self, num_batches, meters, prefix=""):
-        self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
-        self.meters = meters
-        self.prefix = prefix
-
-    def display(self, batch):
-        entries = [self.prefix + self.batch_fmtstr.format(batch)]
-        entries += [str(meter) for meter in self.meters]
-        print('\t'.join(entries))
-
-    def _get_batch_fmtstr(self, num_batches):
-        num_digits = len(str(num_batches // 1))
-        fmt = '{:' + str(num_digits) + 'd}'
-        return '[' + fmt + '/' + fmt.format(num_batches) + ']'
-
+    wandb.log({'val_loss': np.mean(losses)}, step=step)
+    wandb.log({'val_top1': np.mean(top1)}, step=step)
+    wandb.log({'val_top5': np.mean(top5)}, step=step)
 
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
@@ -251,10 +254,12 @@ def accuracy(output, target, topk=(1,)):
 
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
+def average(lst):
+    return sum(lst) / len(lst)
 
 if __name__ == '__main__':
     main()
