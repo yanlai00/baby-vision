@@ -58,7 +58,7 @@ parser.add_argument('--wd', '--weight-decay', default=0, type=float,
                     metavar='W', help='weight decay (default: 0)',
                     dest='weight_decay')
 parser.add_argument('-p', '--print-freq', default=1000, type=int,
-                    metavar='N', help='print frequency (default: 10)') 
+                    metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
 parser.add_argument('--world-size', default=-1, type=int,
@@ -269,7 +269,7 @@ def main_worker(gpu, ngpus_per_node, args):
         adjust_learning_rate(optimizer, epoch, args)
 
         print('Start of epoch ', epoch)
-        
+
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch, args)
 

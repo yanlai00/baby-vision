@@ -194,6 +194,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
+    
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
@@ -306,7 +307,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         if args.gpu is not None:
             images_0 = images[:images.size(0)//2].cuda(args.gpu, non_blocking=True)
             images_1 = images[images.size(0)//2:].cuda(args.gpu, non_blocking=True)
-        
+
         # compute output
         output, target = model(im_q=images_0, im_k=images_1)
         loss = criterion(output, target)
