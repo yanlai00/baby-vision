@@ -58,7 +58,7 @@ parser.add_argument('--wd', '--weight-decay', default=0, type=float,
                     metavar='W', help='weight decay (default: 0)',
                     dest='weight_decay')
 parser.add_argument('-p', '--print-freq', default=1000, type=int,
-                    metavar='N', help='print frequency (default: 10)')
+                   metavar='N', help='print frequency (default: 10)') 
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
 parser.add_argument('--world-size', default=-1, type=int,
@@ -186,12 +186,12 @@ def main_worker(gpu, ngpus_per_node, args):
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
         # comment out the following line for debugging
-        raise NotImplementedError("Only DistributedDataParallel is supported.")
+        #raise NotImplementedError("Only DistributedDataParallel is supported.")
     else:
         # AllGather implementation (batch shuffle, queue update, etc.) in
         # this code only supports DistributedDataParallel.
-        raise NotImplementedError("Only DistributedDataParallel is supported.")
-
+        #raise NotImplementedError("Only DistributedDataParallel is supported.")
+        pass
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
@@ -267,9 +267,13 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch, args)
-
+        
         print('Start of epoch ', epoch)
-
+        for (fuck, _) in train_loader:
+            print(len(fuck))
+            for shit in fuck:
+                print(shit.shape)
+            break
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch, args)
 
@@ -308,6 +312,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             images[1] = images[1].cuda(args.gpu, non_blocking=True)
 
         # compute output
+        print(images.shape)
         output, target = model(im_q=images[0], im_k=images[1])
         loss = criterion(output, target)
 
