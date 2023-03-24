@@ -307,7 +307,6 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             images_0 = images[:images.size(0)//2].cuda(args.gpu, non_blocking=True)
             images_1 = images[images.size(0)//2:].cuda(args.gpu, non_blocking=True)
         
-        print(images_0.shape, images_1.shape)
         # compute output
         output, target = model(im_q=images_0, im_k=images_1)
         loss = criterion(output, target)
