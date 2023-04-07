@@ -20,19 +20,20 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 from utils import GaussianBlur
-
+from sklearn.cluster import KMeans
 import numpy as np
+from torch.utils.data import DataLoader, Dataset
 
 import wandb
 
 parser = argparse.ArgumentParser(description='Temporal classification with headcam data')
 parser.add_argument('--data', help='path to dataset')
 parser.add_argument('--val-data', help='path to validation dataset')
-parser.add_argument('--model', default='convnext_tiny', choices=['resnet50', 'resnext101_32x8d', 'resnext50_32x4d',
-    'mobilenet_v2', 'convnext_tiny', 'convnext_large'], help='model')
+parser.add_argument('--model', default='resnet50', choices=['resnet50', 'resnext101_32x8d', 'resnext50_32x4d',
+                                                            'mobilenet_v2', 'convnext_tiny', 'convnext_large'], help='model')
 parser.add_argument('-j', '--workers', default=16, type=int, metavar='N', help='number of data loading workers (default'
                                                                                ':16)')
-parser.add_argument('--epochs', default=50, type=int, metavar='N', help='number of total epochs to run')
+parser.add_argument('--epochs', default=10, type=int, metavar='N', help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N', help='manual epoch number (useful on restarts)')
 parser.add_argument('-b', '--batch-size', default=64, type=int, metavar='N',
                     help='mini-batch size (default: 64), this is the total batch size of all GPUs on the current node '
@@ -42,6 +43,7 @@ parser.add_argument('--lr', '--learning-rate', default=0.0001, type=float, metav
 parser.add_argument('--wd', '--weight-decay', default=0.0, type=float, metavar='W', help='weight decay (default: 0)',
                     dest='weight_decay')
 parser.add_argument('-p', '--print-freq', default=1000, type=int, metavar='N', help='print frequency (default: 1000)')
+parser.add_argument('-g', '--group_size', default=10, type=int, metavar='N', help='online group size')
 parser.add_argument('--resume', default='', type=str, metavar='PATH', help='path to latest checkpoint (default: none)')
 parser.add_argument('--world-size', default=-1, type=int, help='number of nodes for distributed training')
 parser.add_argument('--rank', default=-1, type=int, help='node rank for distributed training')
@@ -95,23 +97,27 @@ def main_worker(gpu, ngpus_per_node, args):
 
     print('Model:', args.model)
     if args.model == 'convnext_tiny':
-        model = models.convnext_tiny(weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
-    elif args.model == 'convnext_large':
-        model = models.convnext_large(weights = models.ConvNeXt_LARGE_Weights.IMAGENET1K_V1)
+        #model = models.convnext_tiny(weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        model = models.convnext_tiny()
+        #model.classifier[-1] = torch.nn.Identity()
+    if args.model == 'convnext_large':
+        #model = models.convnext_large(weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        model = models.convnext_large()
+        #model.classifier[-1] = torch.nn.Identity()
     else:
-        model = models.__dict__[args.model](pretrained=True)
-
+        model = models.__dict__[args.model](pretrained=False)
     if args.model.startswith('res'):
         model.fc = torch.nn.Linear(in_features=2048, out_features=args.n_out, bias=True)
     elif not args.model.startswith('convnext'):
         model.classifier = torch.nn.Linear(in_features=1280, out_features=args.n_out, bias=True)
     else:
-        model.classifier.append(torch.nn.Linear(1000, args.n_out))
+        model.classifier.append(torch.nn.Linear(1000, args.group_size))
 
     # DataParallel will divide and allocate batch_size to all available GPUs
     model = torch.nn.DataParallel(model).cuda()
+
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
     optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=args.weight_decay)
     cudnn.benchmark = True
 
@@ -155,72 +161,137 @@ def main_worker(gpu, ngpus_per_node, args):
             ])
         )
 
-    val_dataset = datasets.ImageFolder(
-        args.val_data,
-        transforms.Compose([
-            transforms.ToTensor(),
-            normalize
-        ])
-    )
+    #val_dataset = datasets.ImageFolder(
+    #    args.val_data,
+    #    transforms.Compose([
+    #        transforms.ToTensor(),
+    #        normalize
+    #    ])
+    #)
+    # hyperparameters here
+    n_groups = len(torch.unique(torch.Tensor(train_dataset.targets))) // args.group_size
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True, sampler=None
-    )
-    indices = (torch.tensor(val_dataset.targets)[..., None] == 0).any(-1).nonzero(as_tuple=True)[0]
-    val_dataset = torch.utils.data.Subset(val_dataset, indices)
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.batch_size,
-        num_workers=args.workers, pin_memory=True, sampler=None
-    )
+    #train_loader = torch.utils.data.DataLoader(
+    #    train_dataset, batch_size=args.batch_size, shuffle=True,
+    #    num_workers=args.workers, pin_memory=True, sampler=None
+    #)
+    #indices = (torch.tensor(val_dataset.targets)[..., None] == 0).any(-1).nonzero(as_tuple=True)[0]
+    #val_dataset = torch.utils.data.Subset(val_dataset, indices)
+    #val_loader = torch.utils.data.DataLoader(
+    #    val_dataset, batch_size=args.batch_size,
+    #    num_workers=args.workers, pin_memory=True, sampler=None
+    #)
 
     step = 0
 
-    for epoch in range(args.start_epoch, args.epochs):
-        val(val_loader, model, criterion, step, args)
+    #for epoch in range(args.start_epoch, args.epochs):
+    for group in range(n_groups):
         # train for one epoch
-        step = train(train_loader, model, criterion, optimizer, epoch, args)
+        indices = torch.tensor(train_dataset.targets)[..., None] == -1
+        for i in range(group * args.group_size, (group + 1) * args.group_size):
+            indices = torch.logical_or(torch.tensor(train_dataset.targets)[..., None] == i, indices)
+        indices = indices.any(-1).nonzero(as_tuple=True)[0]
+        train_subset = torch.utils.data.Subset(train_dataset, indices)
+        device =torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if args.model == 'convnext_tiny':
+            model.module.classifier[-1] = torch.nn.Linear(1000, args.group_size).to(device)
+        val_subset = train(train_subset, model, criterion, optimizer, group, args)
+        #val_indices = (torch.tensor(val_dataset.targets)[..., None] == group * args.group_size).any(-1).nonzero(as_tuple=True)[0]
+        #val_subset = torch.utils.data.Subset(val_dataset, val_indices)
+        val_loader = torch.utils.data.DataLoader(
+            val_subset, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.workers, pin_memory=True, sampler=None
+        )
+        val(val_loader, model, criterion, group, args)
 
         torch.save({'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict()}, 
-                    os.path.join(exp_path, f'epoch_{epoch}.tar'))
+                    os.path.join(exp_path, f'group_{group}.tar'))
 
+class ModifiedSubset(Dataset):
+    def __init__(self, subset, new_labels):
+        self.subset = subset
+        self.new_labels = new_labels
+        
+    def __getitem__(self, index):
+        image, _ = self.subset[index]
+        new_label = self.new_labels[index]
+        return image, new_label
+    
+    def __len__(self):
+        return len(self.subset)        
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def get_prior(label, n, beta):
+    return torch.softmax(beta * torch.roll(torch.abs(torch.linspace(1, -1, n + 1))[:-1], label), -1)
+
+def train(train_subset, model, criterion, optimizer, group, args):
+    rep = []
+    device =torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(str(group), 'KMeans Start')
+    model.eval()
+    if args.model.startswith('convnext'):
+        last_layer = model.module.classifier[-1]
+        model.module.classifier[-1] = torch.nn.Identity()
+    for idx, (example, label) in enumerate(train_subset):
+        if idx % 1000 == 0:
+            print(idx, label)
+        with torch.no_grad():
+            example = model(example.unsqueeze(0).to(device)).squeeze(0).cpu().detach().numpy()
+        example = example / np.linalg.norm(example)
+        prior = get_prior(label, args.group_size, max(16 - 3 * group, 0))
+        example = np.concatenate((example, prior))
+        rep.append(example)
+    if args.model.startswith('convnext'):
+        model.module.classifier[-1] = last_layer
+    rep = np.vstack(rep)
+    
+    # Another hyperparameter to tune
+    
+    kmeans = KMeans(n_clusters= args.group_size, random_state=0).fit(rep)
+    labels = torch.Tensor(kmeans.labels_).long()
+    print(str(group), "KMeans end")
+    
+    train_loader = torch.utils.data.DataLoader(
+        ModifiedSubset(train_subset, labels), batch_size=args.batch_size, shuffle=True,
+        num_workers=args.workers, pin_memory=True, sampler=None
+    )
+    
     # switch to train mode
     model.train()
+    for epoch in range(args.epochs):
+        num_steps = len(train_loader)
+        for i, (images, target) in enumerate(train_loader):
+            step = group * args.epochs * num_steps + epoch * num_steps + i
 
-    num_steps = len(train_loader)
-    for i, (images, target) in enumerate(train_loader):
-        step = epoch * num_steps + i
+            if args.gpu is not None:
+                images = images.cuda(args.gpu, non_blocking=True)
+            #target = torch.Tensor(labels[args.batch_size * i : min(args.batch_size * (i + 1), len(labels))]).cuda()
+            target, images = target.cuda(), images.cuda()
+            
+            # compute output
+            output = model(images)
+            loss = criterion(output, target)
 
-        if args.gpu is not None:
-            images = images.cuda(args.gpu, non_blocking=True)
-        images = images.cuda()
-        target = target.cuda(args.gpu, non_blocking=True)
-        
-        # compute output
-        output = model(images)
-        loss = criterion(output, target)
-        # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses = loss.item()
-        top1 = acc1[0]
-        top5 = acc5[0]
+            # measure accuracy and record loss
+            acc1, acc5 = accuracy(output, target, topk=(1, 3))
+            losses = loss.item()
+            top1 = acc1[0]
+            top5 = acc5[0]
 
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            # compute gradient and do SGD step
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-        if step % args.print_freq == 0:
-            wandb.log({'train_loss': losses}, step=step)
-            wandb.log({'train_top1': top1}, step=step)
-            wandb.log({'train_top5': top5}, step=step)
-            print(num_steps)
-            print(losses)
+            if step % args.print_freq == 0:
+                wandb.log({'train_loss': losses}, step=step)
+                wandb.log({'train_top1': top1}, step=step)
+                wandb.log({'train_top3': top5}, step=step)
+                print(group, epoch)
+                print(losses)
 
-    return step
+    return ModifiedSubset(train_subset, labels)
+    #return step
 
 def val(val_loader, model, criterion, step, args):
     # switch to eval mode
@@ -234,13 +305,12 @@ def val(val_loader, model, criterion, step, args):
 
         if args.gpu is not None:
             images = images.cuda(args.gpu, non_blocking=True)
-        images = images.cuda()
         target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
         output = model(images)
         loss = criterion(output, target)
-        
+
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
         losses.append(loss.item())
@@ -249,7 +319,7 @@ def val(val_loader, model, criterion, step, args):
 
     wandb.log({'val_loss': np.mean(losses)}, step=step)
     wandb.log({'val_top1': np.mean(top1)}, step=step)
-    wandb.log({'val_top5': np.mean(top5)}, step=step)
+    wandb.log({'val_top3': np.mean(top5)}, step=step)
 
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""

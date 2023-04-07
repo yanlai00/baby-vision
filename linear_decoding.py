@@ -41,8 +41,8 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
-parser.add_argument('--model-name', type=str, default='random',
-                    choices=['random', 'imagenet', 'TC-S', 'TC-A', 'TC-Y', 'TC-SAY', 'moco_img_0011', 'moco_temp_0011'],
+parser.add_argument('--model-name', type=str, default='convnext_tiny',
+                    choices=['random', 'imagenet', 'TC-S', 'TC-A', 'TC-Y', 'TC-SAY', 'moco_img_0011', 'moco_temp_0011', 'convnext_tiny'],
                     help='evaluated model')
 parser.add_argument('--num-outs', default=16127, type=int, help='number of outputs in pretrained model')
 parser.add_argument('--num-classes', default=26, type=int, help='number of classes in downstream classification task')
@@ -114,6 +114,17 @@ def main():
         # Simply call main_worker function
         main_worker(args.gpu, ngpus_per_node, args)
 
+class SWAV(torch.nn.Module):
+    def __init__(self, model, n_out):
+        super(SWAV, self).__init__()
+        self.n_out = n_out
+        #model = models.convnext_tiny(weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        #model = torch.nn.DataParallel(model)
+        self.model = model
+        #self.model.module.classifier[-1] = torch.nn.Identity()
+        self.prototypes = nn.Linear(1000, n_out, bias = False)
+    def forward(self, x):
+        return self.prototypes(self.model(x))
 
 def main_worker(gpu, ngpus_per_node, args):
     args.gpu = gpu
@@ -157,6 +168,15 @@ def main_worker(gpu, ngpus_per_node, args):
         set_parameter_requires_grad(model)  # freeze the trunk
         model.classifier = torch.nn.Linear(in_features=1280, out_features=num_classes, bias=True)
         model = torch.nn.DataParallel(model).cuda()
+    elif args.model_name.startswith('convnext'):
+        model = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        model = torch.nn.DataParallel(model)
+        #model = SWAV(model, 25).cuda()
+        model.load_state_dict(torch.load('experiments/tc_epoch_49.tar')['model_state_dict'], strict = False)
+        set_parameter_requires_grad(model)
+        model.module.classifier.append(torch.nn.Linear(1000, num_classes))
+        #model.prototypes = torch.nn.Linear(1000, num_classes)
+        model = model.cuda()
     else:
         model = models.resnext50_32x4d(pretrained=False)
         model.fc = torch.nn.Linear(in_features=2048, out_features=args.num_outs, bias=True)
@@ -219,6 +239,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if args.gpu is not None:
             images = images.cuda(args.gpu, non_blocking=True)
+        images = images.cuda()
         target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
