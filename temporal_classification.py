@@ -20,6 +20,8 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 from utils import GaussianBlur
+from torch.utils.data import Subset
+from torch.optim.lr_scheduler import StepLR
 
 import numpy as np
 
@@ -37,6 +39,7 @@ parser.add_argument('--start-epoch', default=0, type=int, metavar='N', help='man
 parser.add_argument('-b', '--batch-size', default=64, type=int, metavar='N',
                     help='mini-batch size (default: 64), this is the total batch size of all GPUs on the current node '
                          'when using Data Parallel or Distributed Data Parallel')
+parser.add_argument('--optim', default='adam', type=str, help='optimizer, Choices: ["adam", "sgd"]')
 parser.add_argument('--lr', '--learning-rate', default=0.0001, type=float, metavar='LR', help='initial learning rate',
                     dest='lr')
 parser.add_argument('--wd', '--weight-decay', default=0.0, type=float, metavar='W', help='weight decay (default: 0)',
@@ -65,7 +68,7 @@ def main():
     args = parser.parse_args()
 
     print(args)
-    wandb.init(project="baby-vision", entity="yanlaiy")
+    wandb.init(project="baby-vision", entity="yanlaiy", config=args)
     wandb.config = args
 
     if args.gpu is not None:
@@ -105,7 +108,15 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
-    optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=args.weight_decay)
+    if args.optim == 'adam':
+        optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=args.weight_decay)
+        scheduler = StepLR(optimizer, step_size=10, gamma=1)
+    elif args.optim == 'sgd':
+        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+        scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
+    else:
+        raise NotImplementedError()
+    print(f"Using Optimizer {args.optim} with learing rate {args.lr}")
     cudnn.benchmark = True
 
     if args.resume:
@@ -156,6 +167,17 @@ def main_worker(gpu, ngpus_per_node, args):
         ])
     )
 
+    # Filter the image folders according to args.partition
+    if args.partition != 'SAY':
+        assert args.partition in ['S', 'A', 'Y']
+        train_dataset.class_to_idx = {k: v for (k, v) in train_dataset.class_to_idx.items() if k.startswith(args.partition)}
+        train_idx = [i for i in range(len(train_dataset)) if train_dataset.imgs[i][1] in train_dataset.class_to_idx.values()]
+        train_dataset = Subset(train_dataset, train_idx)
+
+        val_dataset.class_to_idx = {k: v for (k, v) in val_dataset.class_to_idx.items() if k.startswith(args.partition)}
+        val_idx = [i for i in range(len(val_dataset)) if val_dataset.imgs[i][1] in val_dataset.class_to_idx.values()]
+        val_dataset = Subset(val_dataset, val_idx)
+
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=args.workers, pin_memory=True, sampler=None
@@ -172,7 +194,8 @@ def main_worker(gpu, ngpus_per_node, args):
         val(val_loader, model, criterion, step, args)
         # train for one epoch
         step = train(train_loader, model, criterion, optimizer, epoch, args)
-
+        scheduler.step()
+        wandb.log({'lr': scheduler.get_last_lr()[0]}, step=step)
         torch.save({'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict()}, 
                     os.path.join(exp_path, f'epoch_{epoch}.tar'))
