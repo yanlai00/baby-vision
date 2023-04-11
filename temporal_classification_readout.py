@@ -22,6 +22,8 @@ import torchvision.models as models
 from utils import GaussianBlur
 from torch.utils.data import Subset
 from torch.optim.lr_scheduler import StepLR
+from linear_decoding import AverageMeter, ProgressMeter, load_split_train_test, validate
+from linear_decoding import train as val_step
 
 import numpy as np
 
@@ -31,7 +33,7 @@ parser = argparse.ArgumentParser(description='Temporal classification with headc
 parser.add_argument('--data', help='path to dataset')
 parser.add_argument('--val-data', help='path to validation dataset')
 parser.add_argument('--model', default='resnet50', choices=['resnet50', 'resnext101_32x8d', 'resnext50_32x4d',
-                                                            'mobilenet_v2'], help='model')
+                                                            'mobilenet_v2', 'convnext_tiny', 'convnext_large'], help='model')
 parser.add_argument('-j', '--workers', default=16, type=int, metavar='N', help='number of data loading workers (default'
                                                                                ':16)')
 parser.add_argument('--epochs', default=50, type=int, metavar='N', help='number of total epochs to run')
@@ -42,6 +44,7 @@ parser.add_argument('-b', '--batch-size', default=64, type=int, metavar='N',
 parser.add_argument('--optim', default='sgd', type=str, help='optimizer, Choices: ["adam", "sgd"]')
 parser.add_argument('--lr', '--learning-rate', default=0.0001, type=float, metavar='LR', help='initial learning rate',
                     dest='lr')
+parser.add_argument('--lp_lr', '--lp_learning-rate', default=0.003, type=float, help='initial learning ratefor downstream task')
 parser.add_argument('--wd', '--weight-decay', default=0.0, type=float, metavar='W', help='weight decay (default: 0)',
                     dest='weight_decay')
 parser.add_argument('-p', '--print-freq', default=1000, type=int, metavar='N', help='print frequency (default: 1000)')
@@ -60,6 +63,8 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 parser.add_argument('--n_out', default=1000, type=int, help='output dim')
 parser.add_argument('--augmentation', default=True, action='store_false', help='whether to use data augmentation?')
 parser.add_argument('--partition', default='SAY', type=str, help='which partition to process. Choices: [S, A, Y, SAY]')
+parser.add_argument('--num-classes', default=26, type=int, help='number of classes in downstream classification task')
+parser.add_argument('--lp_epochs', default=20, type=int, metavar='N', help='number of total epochs to run in linear probing')
 
 SEG_LEN = 288
 FPS = 5
@@ -68,7 +73,7 @@ def main():
     args = parser.parse_args()
 
     print(args)
-    wandb.init(project="baby-vision", entity="yanlaiy", config=args)
+    wandb.init(project="baby-vision", entity="peiqiliu", config=args)
     wandb.config = args
 
     if args.gpu is not None:
@@ -97,11 +102,23 @@ def main_worker(gpu, ngpus_per_node, args):
         print("Use GPU: {} for training".format(args.gpu))
 
     print('Model:', args.model)
-    model = models.__dict__[args.model](pretrained=False)
+    if args.model == 'convnext_tiny':
+        #model = models.convnext_tiny(weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        model = models.convnext_tiny()
+    if args.model == 'convnext_large':
+        #model = models.convnext_large(weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        model = models.convnext_large()
+    else:
+        model = models.__dict__[args.model](pretrained=False)
     if args.model.startswith('res'):
         model.fc = torch.nn.Linear(in_features=2048, out_features=args.n_out, bias=True)
-    else:
+    #elif args.model.startswith('convnext'):
+        #model.classifier = torch.nn.Linear(in_features = 768, out_features = args.n_out, bias = True)
+    #else:
+    elif not args.model.startswith('convnext'):
         model.classifier = torch.nn.Linear(in_features=1280, out_features=args.n_out, bias=True)
+    else:
+        model.classifier.append(torch.nn.Linear(1000, args.n_out))
 
     # DataParallel will divide and allocate batch_size to all available GPUs
     model = torch.nn.DataParallel(model).cuda()
@@ -159,13 +176,13 @@ def main_worker(gpu, ngpus_per_node, args):
             ])
         )
 
-    val_dataset = datasets.ImageFolder(
-        args.val_data,
-        transforms.Compose([
-            transforms.ToTensor(),
-            normalize
-        ])
-    )
+    #val_dataset = datasets.ImageFolder(
+    #    args.val_data,
+    #    transforms.Compose([
+    #        transforms.ToTensor(),
+    #        normalize
+    #    ])
+    #)
 
     # Filter the image folders according to args.partition
     if args.partition != 'SAY':
@@ -174,24 +191,25 @@ def main_worker(gpu, ngpus_per_node, args):
         train_idx = [i for i in range(len(train_dataset)) if train_dataset.imgs[i][1] in train_dataset.class_to_idx.values()]
         train_dataset = Subset(train_dataset, train_idx)
 
-        val_dataset.class_to_idx = {k: v for (k, v) in val_dataset.class_to_idx.items() if k.startswith(args.partition)}
-        val_idx = [i for i in range(len(val_dataset)) if val_dataset.imgs[i][1] in val_dataset.class_to_idx.values()]
-        val_dataset = Subset(val_dataset, val_idx)
+        #val_dataset.class_to_idx = {k: v for (k, v) in val_dataset.class_to_idx.items() if k.startswith(args.partition)}
+        #val_idx = [i for i in range(len(val_dataset)) if val_dataset.imgs[i][1] in val_dataset.class_to_idx.values()]
+        #val_dataset = Subset(val_dataset, val_idx)
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=args.workers, pin_memory=True, sampler=None
     )
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.batch_size,
-        num_workers=args.workers, pin_memory=True, sampler=None
-    )
+    #val_loader = torch.utils.data.DataLoader(
+    #    val_dataset, batch_size=args.batch_size,
+    #    num_workers=args.workers, pin_memory=True, sampler=None
+    #)
 
     step = 0
 
     for epoch in range(args.start_epoch, args.epochs):
         
-        val(val_loader, model, criterion, step, args)
+        if epoch % 2 == 0:
+            val(args.val_data, model, criterion, step, args)
         # train for one epoch
         step = train(train_loader, model, criterion, optimizer, epoch, args)
         scheduler.step()
@@ -237,33 +255,32 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
     return step
 
-def val(val_loader, model, criterion, step, args):
-    # switch to eval mode
-    model.eval()
-
-    losses = []
-    top1 = []
-    top5 = []
-
-    for i, (images, target) in enumerate(val_loader):
-
-        if args.gpu is not None:
-            images = images.cuda(args.gpu, non_blocking=True)
-        target = target.cuda(args.gpu, non_blocking=True)
-
-        # compute output
-        output = model(images)
-        loss = criterion(output, target)
-
-        # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.append(loss.item())
-        top1.append(acc1[0].cpu())
-        top5.append(acc5[0].cpu())
-
-    wandb.log({'val_loss': np.mean(losses)}, step=step)
-    wandb.log({'val_top1': np.mean(top1)}, step=step)
-    wandb.log({'val_top5': np.mean(top5)}, step=step)
+def val(val_dir, model, criterion, step, args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.model.startswith('res'):
+        last_layer = model.module.fc
+        model.module.fc = torch.nn.Linear(2048, args.num_classes).to(device)
+        optimizer = torch.optim.SGD([model.module.fc.weight], args.lp_lr, momentum = 0.9, weight_decay=args.weight_decay)
+    elif not args.model.startswith('convnext'):
+        last_layer = model.module.classifier
+        model.module.classifier = torch.nn.Linear(1280, args.num_classes).to(device)
+        optimizer = torch.optim.SGD([model.module.classifier.weight], args.lp_lr, momentum = 0.9, weight_decay=args.weight_decay)
+    else:
+        last_layer = model.module.classifier[-1]
+        model.module.classifier[-1] = torch.nn.Linear(1000, args.num_classes).to(device)
+        optimizer = torch.optim.SGD([model.module.classifier[-1].weight], args.lp_lr, momentum = 0.9, weight_decay=args.weight_decay)
+    args.subsample = False
+    val_train, val_test = load_split_train_test(val_dir, args)
+    for epoch in range(args.lp_epochs):
+        top1 = val_step(val_train, model, criterion, optimizer, epoch, args)
+    val_top1 = validate(val_test, model, args)[0]
+    wandb.log({'val_top1': val_top1}, step=step)
+    if args.model.startswith('res'):
+        model.module.fc = last_layer
+    elif not args.model.startswith('convnext'):
+        model.module.classifier = last_layer
+    else:
+        model.module.classifier[-1] = last_layer
 
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""

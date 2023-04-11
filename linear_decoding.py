@@ -136,9 +136,11 @@ def main_worker(gpu, ngpus_per_node, args):
     num_classes = args.num_classes
 
     if args.model_name == 'random':
-        model = models.mobilenet_v2(pretrained=False)
+        #model = models.mobilenet_v2(pretrained=False)
+        model = models.resnext50_32x4d(pretrained=False)
         set_parameter_requires_grad(model)
-        model.classifier = torch.nn.Linear(in_features=1280, out_features=num_classes, bias=True)
+        model.fc = torch.nn.Linear(in_features=2048, out_features=args.num_outs, bias=True)
+        #model.classifier = torch.nn.Linear(in_features=1280, out_features=num_classes, bias=True)
         model = torch.nn.DataParallel(model).cuda()
     elif args.model_name == 'imagenet':
         model = models.mobilenet_v2(pretrained=True)
@@ -178,7 +180,8 @@ def main_worker(gpu, ngpus_per_node, args):
         #model.prototypes = torch.nn.Linear(1000, num_classes)
         model = model.cuda()
     else:
-        model = models.resnext50_32x4d(pretrained=False)
+        #model = models.resnext50_32x4d(pretrained=False)
+        model = models.resnet50(pretrained=False)
         model.fc = torch.nn.Linear(in_features=2048, out_features=args.num_outs, bias=True)
         model = torch.nn.DataParallel(model).cuda()
         checkpoint = torch.load(args.model_name + '.tar')
