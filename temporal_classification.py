@@ -31,7 +31,7 @@ parser = argparse.ArgumentParser(description='Temporal classification with headc
 parser.add_argument('--data', help='path to dataset')
 parser.add_argument('--val-data', help='path to validation dataset')
 parser.add_argument('--model', default='resnet50', choices=['resnet50', 'resnext101_32x8d', 'resnext50_32x4d',
-                                                            'mobilenet_v2'], help='model')
+                                                            'mobilenet_v2', 'convnext_tiny', 'convnext_large'], help='model')
 parser.add_argument('-j', '--workers', default=16, type=int, metavar='N', help='number of data loading workers (default'
                                                                                ':16)')
 parser.add_argument('--epochs', default=50, type=int, metavar='N', help='number of total epochs to run')
@@ -68,7 +68,7 @@ def main():
     args = parser.parse_args()
 
     print(args)
-    wandb.init(project="baby-vision", entity="yanlaiy", config=args)
+    wandb.init(project="baby-vision", entity="peiqiliu")
     wandb.config = args
 
     if args.gpu is not None:
@@ -97,11 +97,23 @@ def main_worker(gpu, ngpus_per_node, args):
         print("Use GPU: {} for training".format(args.gpu))
 
     print('Model:', args.model)
-    model = models.__dict__[args.model](pretrained=False)
+    if args.model == 'convnext_tiny':
+        #model = models.convnext_tiny(weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        model = models.convnext_tiny()
+    if args.model == 'convnext_large':
+        #model = models.convnext_large(weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        model = models.convnext_large()
+    else:
+        model = models.__dict__[args.model](pretrained=False)
     if args.model.startswith('res'):
         model.fc = torch.nn.Linear(in_features=2048, out_features=args.n_out, bias=True)
-    else:
+    #elif args.model.startswith('convnext'):
+        #model.classifier = torch.nn.Linear(in_features = 768, out_features = args.n_out, bias = True)
+    #else:
+    elif not args.model.startswith('convnext'):
         model.classifier = torch.nn.Linear(in_features=1280, out_features=args.n_out, bias=True)
+    else:
+        model.classifier.append(torch.nn.Linear(1000, args.n_out))
 
     # DataParallel will divide and allocate batch_size to all available GPUs
     model = torch.nn.DataParallel(model).cuda()
@@ -232,7 +244,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             wandb.log({'train_loss': losses}, step=step)
             wandb.log({'train_top1': top1}, step=step)
             wandb.log({'train_top5': top5}, step=step)
-            print(num_steps)
+            print(epoch)
             print(losses)
 
     return step
