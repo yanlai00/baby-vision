@@ -47,7 +47,7 @@ parser.add_argument('-b', '--batch-size', default=64, type=int, metavar='N',
 parser.add_argument('--optim', default='sgd', type=str, help='optimizer, Choices: ["adam", "sgd"]')
 parser.add_argument('--lr', '--learning-rate', default=0.0001, type=float, metavar='LR', help='initial learning rate',
                     dest='lr')
-parser.add_argument('--lp_lr', '--lp_learning-rate', default=0.0005, type=float, help='initial learning ratefor downstream task')
+parser.add_argument('--lp_lr', '--lp_learning-rate', default=0.0006, type=float, help='initial learning ratefor downstream task')
 parser.add_argument('--wd', '--weight-decay', default=0.0, type=float, metavar='W', help='weight decay (default: 0)',
                     dest='weight_decay')
 parser.add_argument('-p', '--print-freq', default=1000, type=int, metavar='N', help='print frequency (default: 1000)')
@@ -67,10 +67,14 @@ parser.add_argument('--n_out', default=1000, type=int, help='output dim')
 parser.add_argument('--augmentation', default=True, action='store_false', help='whether to use data augmentation?')
 parser.add_argument('--partition', default='SAY', type=str, help='which partition to process. Choices: [S, A, Y, SAY]')
 parser.add_argument('--num-classes', default=26, type=int, help='number of classes in downstream classification task')
-parser.add_argument('--lp_epochs', default=50, type=int, metavar='N', help='number of total epochs to run in linear probing')
+parser.add_argument('--lp_epochs', default=40, type=int, metavar='N', help='number of total epochs to run in linear probing')
 
 SEG_LEN = 288
 FPS = 5
+
+def set_parameter_requires_grad(model, train=True):
+    for param in model.parameters():
+        param.requires_grad = train
 
 def main():
     args = parser.parse_args()
@@ -154,84 +158,149 @@ def main_worker(gpu, ngpus_per_node, args):
 
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
-    if args.augmentation:
-        train_dataset = datasets.ImageFolder(
-            args.data,
-            transforms.Compose([
-                        transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
-                        transforms.RandomApply([transforms.ColorJitter(0.9, 0.9, 0.9, 0.5)], p=0.9),
-                        transforms.RandomGrayscale(p=0.2),
-                        transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.5),
-                        transforms.RandomHorizontalFlip(),
-                        transforms.ToTensor(),
-                        normalize
-                        ])
-        )
-    else:
-        train_dataset = datasets.ImageFolder(
-            args.data,
-            transforms.Compose([
-                transforms.ToTensor(),
-                normalize
-            ])
-        )
+    train_dataset = datasets.ImageFolder(
+        args.data,
+        transforms.Compose([
+            transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
+            transforms.RandomApply([transforms.ColorJitter(0.9, 0.9, 0.9, 0.5)], p=0.9),
+            transforms.RandomGrayscale(p=0.2),
+            transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.5),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize
+        ])
+    )
+    kmeans_dataset = datasets.ImageFolder(
+        args.data,
+        transforms.Compose([
+            transforms.ToTensor(),
+            normalize
+        ])
+    )
 
     # Filter the image folders according to args.partition
     if args.partition != 'SAY':
         assert args.partition in ['S', 'A', 'Y']
-        train_dataset.class_to_idx = {k: v for (k, v) in train_dataset.class_to_idx.items() if k.startswith(args.partition)}
-        train_idx = [i for i in range(len(train_dataset)) if train_dataset.imgs[i][1] in train_dataset.class_to_idx.values()]
+        class_to_idx = {k: v for (k, v) in train_dataset.class_to_idx.items() if k.startswith(args.partition)}
+        train_idx = [i for i in range(len(train_dataset)) if train_dataset.imgs[i][1] in class_to_idx.values()]
         train_dataset = Subset(train_dataset, train_idx)
+        train_dataset.class_to_idx = class_to_idx
+        kmeans_dataset = Subset(kmeans_dataset, train_idx)
+        kmeans_dataset.class_to_idx = class_to_idx
+    else:
+        class_to_idx = train_dataset.class_to_idx
+        train_dataset = Subset(train_dataset, range(len(train_dataset)))
+        kmeans_dataset = Subset(kmeans_dataset, range(len(kmeans_dataset)))
+        train_dataset.class_to_idx = class_to_idx
+        kmeans_dataset.class_to_idx = class_to_idx
 
     step = 0
 
     for epoch in range(args.start_epoch, args.epochs):
         
-        val(args.val_data, model, criterion, step, args)
+        if epoch % 2 == 0:
+            set_parameter_requires_grad(model, False)
+            val(args.val_data, model, criterion, step, args)
+            set_parameter_requires_grad(model, True)
+        if epoch % 8 == 0:
+            start_time = time.time()
+            set_parameter_requires_grad(model, False)
+            print("KMeans start")
+            if args.model.startswith('convnext'):
+                #last_layer = model.module.classifier[-1]
+                model.module.classifier[-1] = torch.nn.Identity()
+            elif args.model.startswith('res'):
+                #last_layer = model.module.fc
+                model.module.fc = torch.nn.Identity()
+            else:
+                #last_layer = model.module.classifier
+                model.module.classifier = torch.nn.Identity()
+        
+            labels = get_labels(kmeans_dataset, 10, model, epoch, args)
+            torch.save(labels, os.path.join(args.exp_path, f'cluster_{epoch}.tar'))
+            
+            if args.model.startswith('convnext'):
+                model.module.classifier[-1] = torch.nn.Linear(in_features=1000, out_features=args.n_out, bias=True).cuda()
+                rename_optimizer = torch.optim.Adam([model.module.classifier[-1].weight], args.lp_lr, weight_decay=args.weight_decay)
+            elif args.model.startswith('res'):
+                model.module.fc = torch.nn.Linear(in_features=2048, out_features=args.n_out, bias=True).cuda()
+                rename_optimizer = torch.optim.Adam([model.module.fc.weight], args.lp_lr, weight_decay=args.weight_decay)
+            else:
+                model.module.classifier = torch.nn.Linear(in_features=1280, out_features=args.n_out, bias=True).cuda()
+                rename_optimizer = torch.optim.Adam([model.module.classifier.weight], args.lp_lr, weight_decay=args.weight_decay)
+            print("KMeans end")
+            end_time = time.time()
+            print("KMeans takes " + str(- start_time + end_time))
+    
+        train_loader = torch.utils.data.DataLoader(
+            ModifiedSubset(train_dataset, labels), batch_size=args.batch_size, shuffle=True,
+            num_workers=args.workers, pin_memory=True, sampler=None
+        )
+        
         # train for one epoch
-        step = train(train_dataset, model, criterion, optimizer, epoch, args)
-        scheduler.step()
-        #wandb.log({'lr': scheduler.get_last_lr()}, step=step)
-        torch.save({'model_state_dict': model.state_dict(),
+        if epoch % 8 == 0:
+            step = train(train_loader, model, criterion, rename_optimizer, epoch, args)
+            set_parameter_requires_grad(model, True)
+        else:
+            step = train(train_loader, model, criterion, optimizer, epoch, args)
+            scheduler.step()
+            torch.save({'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict()}, 
                     os.path.join(exp_path, f'epoch_{epoch}.tar'))
 
-        
-def get_labels(train_dataset, group_size, model):
+def KMeans(X, num_clusters = 10, max_iter = 100):
+    # Initialize cluster centroids randomly
+    centroids = X[torch.randperm(X.shape[0])[:num_clusters]]
+
+    # Loop until convergence or maximum iterations reached
+    for i in range(max_iter):
+        # Compute distances between each point and each centroid
+        distances = torch.cdist(X, centroids)
+    
+        # Assign each point to the closest centroid
+        cluster_labels = torch.argmin(distances, dim=1)
+        # Update cluster centroids
+        for j in range(num_clusters):
+            mask = cluster_labels == j
+            if mask.any():
+                centroids[j] = X[mask].mean(dim=0)
+    return cluster_labels
+    
+def get_prior(target, n, beta):
+    entropy = torch.roll(1 - 0.2 * torch.abs(torch.linspace(0, n - 1, n) - ((n - 1) // 2)), -((n -1) // 2))
+    return torch.stack([torch.softmax(beta * torch.roll(entropy, label.item()), -1) for label in target])
+    
+def get_labels(train_dataset, group_size, model, epoch, args):
     device =torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    labels = torch.tensor(())
-    existing_labels = []
-    rep = []
+    labels = torch.tensor(list(train_dataset.class_to_idx.values()))
+    targets = torch.tensor(())
+    last_time = time.time()
     model.eval()
-    cur_time = time.time()
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=200, shuffle=False, pin_memory=True
-    )
-    for idx, (example, label) in enumerate(train_loader):
-        if label[-1] not in existing_labels:
-            existing_labels.append(label[-1])
-            if (len(existing_labels) - 1) % group_size == 0 and len(existing_labels) != 1:
-                group = len(existing_labels) // group_size - 1
-                rep = np.vstack(rep)
-                kmeans = KMeans(n_clusters= group_size, random_state=0, n_init = "auto").fit(rep)
-                cur_labels = torch.Tensor(kmeans.labels_).long()
-                labels = torch.concatenate((labels, cur_labels + group * group_size))
-                rep = []
-        if idx % 120 == 0:
-            print(idx, time.time() - cur_time)
-            cur_time = time.time()
-        with torch.no_grad():
-            example = model(example.to(device)).cpu().detach().numpy()
-        example = example / np.linalg.norm(example)
-        rep.append(example)
-    if len(rep) != 0:
-        group = (len(existing_labels) - 1) // group_size
-        n_clusters = len(existing_labels) % group_size if len(existing_labels) % group_size != 0 else group_size
-        rep = np.vstack(rep)
-        kmeans = KMeans(n_clusters= n_clusters, random_state=0, n_init = "auto").fit(rep)
-        cur_labels = torch.Tensor(kmeans.labels_).long()
-        labels = torch.concatenate((labels, cur_labels + group * group_size))   
-    return labels.long()
+    for group in range(int(np.ceil(len(labels) / group_size))):
+        if group % 10 == 0:
+            print(group, time.time() - last_time)
+            last_time = time.time()
+        start = time.time()
+        group_labels = labels[torch.linspace(group * group_size, (group + 1) * group_size - 1, group_size).long()]
+        class_to_idx = {k: v for (k, v) in train_dataset.class_to_idx.items() if v in group_labels}
+        train_idx = [i for i in range(len(train_dataset.dataset)) if train_dataset.dataset.imgs[i][1] in class_to_idx.values()]
+        one_train_dataset = Subset(train_dataset.dataset, train_idx)
+        train_loader = torch.utils.data.DataLoader(
+            one_train_dataset, batch_size=128, shuffle=False, pin_memory=True)
+        rep = []
+        for idx, (images, tc_label) in enumerate(train_loader):
+            with torch.no_grad():
+                output = model(images.to(device))
+            output = (output.permute(1, 0) / torch.linalg.norm(output, dim = -1)).permute(1, 0) # (batch_size, feature_dim)
+            
+            # Hyperparameter
+            prior = get_prior(tc_label - group * group_size, group_size, 30 / (1.1 ** epoch)).cuda(args.gpu, non_blocking=True)
+            output = torch.concatenate((output, prior), -1)
+            rep.append(output) 
+        rep = torch.vstack(rep) # (batch_size, feature_dim)
+        cur_targets = KMeans(rep, np.min(((group + 1) * group_size, len(labels))) - group * group_size).cpu()
+        targets = torch.concatenate((targets, cur_targets + group * group_size))
+    return targets.long()
 
 class ModifiedSubset(Dataset):
     def __init__(self, subset, new_labels):
@@ -246,36 +315,8 @@ class ModifiedSubset(Dataset):
     def __len__(self):
         return len(self.subset)  
     
-def train(train_subset, model, criterion, optimizer, epoch, args):
-    start_time = time.time()
-    print("KMeans start")
-    if args.model.startswith('convnext'):
-        last_layer = model.module.classifier[-1]
-        model.module.classifier[-1] = torch.nn.Identity()
-    elif args.model.startswith('res'):
-        last_layer = model.module.fc
-        model.module.fc = torch.nn.Identity()
-    else:
-        last_layer = model.module.classifier
-        model.module.classifier = torch.nn.Identity()
-        
-    labels = get_labels(train_subset, 10, model)
-    torch.save(labels, os.path.join(args.exp_path, f'cluster_{epoch}.tar'))
+def train(train_loader, model, criterion, optimizer, epoch, args):
     
-    if args.model.startswith('convnext'):
-        model.module.classifier[-1] = last_layer
-    elif args.model.startswith('res'):
-        model.module.fc = last_layer
-    else:
-        model.module.classifier = last_layer
-    print("KMeans end")
-    end_time = time.time()
-    print("KMeans takes " + str(- start_time + end_time))
-    
-    train_loader = torch.utils.data.DataLoader(
-        ModifiedSubset(train_subset, labels), batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True, sampler=None
-    )
     # switch to train mode
     model.train()
 
