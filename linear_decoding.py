@@ -114,18 +114,6 @@ def main():
         # Simply call main_worker function
         main_worker(args.gpu, ngpus_per_node, args)
 
-class SWAV(torch.nn.Module):
-    def __init__(self, model, n_out):
-        super(SWAV, self).__init__()
-        self.n_out = n_out
-        #model = models.convnext_tiny(weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
-        #model = torch.nn.DataParallel(model)
-        self.model = model
-        #self.model.module.classifier[-1] = torch.nn.Identity()
-        self.prototypes = nn.Linear(1000, n_out, bias = False)
-    def forward(self, x):
-        return self.prototypes(self.model(x))
-
 def main_worker(gpu, ngpus_per_node, args):
     args.gpu = gpu
 
