@@ -45,7 +45,7 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 parser.add_argument('--model-name', type=str, default='convnext_tiny',
                     choices=['random', 'imagenet', 'TC-S', 'TC-A', 'TC-Y', 'TC-SAY', 'moco_img_0011', 'moco_temp_0011', 'convnext_tiny'],
                     help='evaluated model')
-parser.add_argument('--num-outs', default=16127, type=int, help='number of outputs in pretrained model')
+parser.add_argument('--num-outs', default=1220, type=int, help='number of outputs in pretrained model')
 parser.add_argument('--num-classes', default=12, type=int, help='number of classes in downstream classification task')
 parser.add_argument('--checkpoint-path', type=str, help='path to model checkpoint')
 
