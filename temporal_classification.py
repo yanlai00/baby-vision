@@ -22,7 +22,7 @@ import torchvision.models as models
 from utils import GaussianBlur
 from torch.utils.data import Subset
 from torch.optim.lr_scheduler import StepLR
-
+from temporal_kmeans_offline import val
 import numpy as np
 
 import wandb
@@ -60,6 +60,9 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 parser.add_argument('--n_out', default=1000, type=int, help='output dim')
 parser.add_argument('--augmentation', default=True, action='store_false', help='whether to use data augmentation?')
 parser.add_argument('--partition', default='SAY', type=str, help='which partition to process. Choices: [S, A, Y, SAY]')
+parser.add_argument('--num-classes', default=26, type=int, help='number of classes in downstream classification task')
+parser.add_argument('--lp_epochs', default=40, type=int, metavar='N', help='number of total epochs to run in linear probing')
+parser.add_argument('--lp_lr', '--lp_learning-rate', default=0.0006, type=float, help='initial learning ratefor downstream task')
 
 SEG_LEN = 288
 FPS = 5
@@ -68,7 +71,7 @@ def main():
     args = parser.parse_args()
 
     print(args)
-    wandb.init(project="baby-vision", entity="peiqiliu")
+    wandb.init(project="baby-vision-hyperparameter", entity="peiqiliu", name = "iamgenet-TC")
     wandb.config = args
 
     if args.gpu is not None:
@@ -104,7 +107,7 @@ def main_worker(gpu, ngpus_per_node, args):
         #model = models.convnext_large(weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
         model = models.convnext_large()
     else:
-        model = models.__dict__[args.model](pretrained=False)
+        model = models.__dict__[args.model](pretrained=True)
     if args.model.startswith('res'):
         model.fc = torch.nn.Linear(in_features=2048, out_features=args.n_out, bias=True)
     #elif args.model.startswith('convnext'):
@@ -203,7 +206,9 @@ def main_worker(gpu, ngpus_per_node, args):
 
     for epoch in range(args.start_epoch, args.epochs):
         
-        val(val_loader, model, criterion, step, args)
+        #val(val_loader, model, criterion, step, args)
+        if epoch % 2 == 0:
+            val(args.val_data, model, criterion, step, args)
         # train for one epoch
         step = train(train_loader, model, criterion, optimizer, epoch, args)
         scheduler.step()
@@ -249,32 +254,32 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
     return step
 
-def val(val_loader, model, criterion, step, args):
+#def val(val_loader, model, criterion, step, args):
     # switch to eval mode
-    model.eval()
-
-    losses = []
-    top1 = []
-    top5 = []
-
-    for i, (images, target) in enumerate(val_loader):
-
-        if args.gpu is not None:
-            images = images.cuda(args.gpu, non_blocking=True)
-        target = target.cuda(args.gpu, non_blocking=True)
-
+#    model.eval()
+#
+#    losses = []
+#    top1 = []
+#    top5 = []
+#
+#    for i, (images, target) in enumerate(val_loader):
+#
+#        if args.gpu is not None:
+#            images = images.cuda(args.gpu, non_blocking=True)
+#        target = target.cuda(args.gpu, non_blocking=True)
+#
         # compute output
-        output = model(images)
-        loss = criterion(output, target)
+#        output = model(images)
+#        loss = criterion(output, target)
 
         # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.append(loss.item())
-        top1.append(acc1[0].cpu())
-        top5.append(acc5[0].cpu())
+#        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+#        losses.append(loss.item())
+#        top1.append(acc1[0].cpu())
+#        top5.append(acc5[0].cpu())
 
-    wandb.log({'val_loss': np.mean(losses)}, step=step)
-    wandb.log({'val_top1': np.mean(top1)}, step=step)
+#    wandb.log({'val_loss': np.mean(losses)}, step=step)
+#    wandb.log({'val_top1': np.mean(top1)}, step=step)
     wandb.log({'val_top5': np.mean(top5)}, step=step)
 
 def accuracy(output, target, topk=(1,)):
