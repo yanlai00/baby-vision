@@ -22,7 +22,7 @@ import torchvision.models as models
 from utils import GaussianBlur
 from torch.utils.data import Subset
 from torch.optim.lr_scheduler import StepLR
-
+from temporal_kmeans_offline import val
 import numpy as np
 
 import wandb
@@ -31,7 +31,7 @@ parser = argparse.ArgumentParser(description='Temporal classification with headc
 parser.add_argument('--data', help='path to dataset')
 parser.add_argument('--val-data', help='path to validation dataset')
 parser.add_argument('--model', default='resnet50', choices=['resnet50', 'resnext101_32x8d', 'resnext50_32x4d',
-                                                            'mobilenet_v2'], help='model')
+                                                            'mobilenet_v2', 'convnext_tiny', 'convnext_large'], help='model')
 parser.add_argument('-j', '--workers', default=16, type=int, metavar='N', help='number of data loading workers (default'
                                                                                ':16)')
 parser.add_argument('--epochs', default=50, type=int, metavar='N', help='number of total epochs to run')
@@ -39,7 +39,7 @@ parser.add_argument('--start-epoch', default=0, type=int, metavar='N', help='man
 parser.add_argument('-b', '--batch-size', default=64, type=int, metavar='N',
                     help='mini-batch size (default: 64), this is the total batch size of all GPUs on the current node '
                          'when using Data Parallel or Distributed Data Parallel')
-parser.add_argument('--optim', default='adam', type=str, help='optimizer, Choices: ["adam", "sgd"]')
+parser.add_argument('--optim', default='sgd', type=str, help='optimizer, Choices: ["adam", "sgd"]')
 parser.add_argument('--lr', '--learning-rate', default=0.0001, type=float, metavar='LR', help='initial learning rate',
                     dest='lr')
 parser.add_argument('--wd', '--weight-decay', default=0.0, type=float, metavar='W', help='weight decay (default: 0)',
@@ -60,6 +60,9 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 parser.add_argument('--n_out', default=1000, type=int, help='output dim')
 parser.add_argument('--augmentation', default=True, action='store_false', help='whether to use data augmentation?')
 parser.add_argument('--partition', default='SAY', type=str, help='which partition to process. Choices: [S, A, Y, SAY]')
+parser.add_argument('--num-classes', default=26, type=int, help='number of classes in downstream classification task')
+parser.add_argument('--lp_epochs', default=40, type=int, metavar='N', help='number of total epochs to run in linear probing')
+parser.add_argument('--lp_lr', '--lp_learning-rate', default=0.0006, type=float, help='initial learning ratefor downstream task')
 
 SEG_LEN = 288
 FPS = 5
@@ -97,11 +100,23 @@ def main_worker(gpu, ngpus_per_node, args):
         print("Use GPU: {} for training".format(args.gpu))
 
     print('Model:', args.model)
-    model = models.__dict__[args.model](pretrained=False)
+    if args.model == 'convnext_tiny':
+        #model = models.convnext_tiny(weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        model = models.convnext_tiny()
+    if args.model == 'convnext_large':
+        #model = models.convnext_large(weights = models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        model = models.convnext_large()
+    else:
+        model = models.__dict__[args.model](pretrained=True)
     if args.model.startswith('res'):
         model.fc = torch.nn.Linear(in_features=2048, out_features=args.n_out, bias=True)
-    else:
+    #elif args.model.startswith('convnext'):
+        #model.classifier = torch.nn.Linear(in_features = 768, out_features = args.n_out, bias = True)
+    #else:
+    elif not args.model.startswith('convnext'):
         model.classifier = torch.nn.Linear(in_features=1280, out_features=args.n_out, bias=True)
+    else:
+        model.classifier.append(torch.nn.Linear(1000, args.n_out))
 
     # DataParallel will divide and allocate batch_size to all available GPUs
     model = torch.nn.DataParallel(model).cuda()
@@ -191,7 +206,9 @@ def main_worker(gpu, ngpus_per_node, args):
 
     for epoch in range(args.start_epoch, args.epochs):
         
-        val(val_loader, model, criterion, step, args)
+        #val(val_loader, model, criterion, step, args)
+        if epoch % 2 == 0:
+            val(args.val_data, model, criterion, step, args)
         # train for one epoch
         step = train(train_loader, model, criterion, optimizer, epoch, args)
         scheduler.step()
@@ -232,37 +249,37 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             wandb.log({'train_loss': losses}, step=step)
             wandb.log({'train_top1': top1}, step=step)
             wandb.log({'train_top5': top5}, step=step)
-            print(num_steps)
+            print(epoch)
             print(losses)
 
     return step
 
-def val(val_loader, model, criterion, step, args):
+#def val(val_loader, model, criterion, step, args):
     # switch to eval mode
-    model.eval()
-
-    losses = []
-    top1 = []
-    top5 = []
-
-    for i, (images, target) in enumerate(val_loader):
-
-        if args.gpu is not None:
-            images = images.cuda(args.gpu, non_blocking=True)
-        target = target.cuda(args.gpu, non_blocking=True)
-
+#    model.eval()
+#
+#    losses = []
+#    top1 = []
+#    top5 = []
+#
+#    for i, (images, target) in enumerate(val_loader):
+#
+#        if args.gpu is not None:
+#            images = images.cuda(args.gpu, non_blocking=True)
+#        target = target.cuda(args.gpu, non_blocking=True)
+#
         # compute output
-        output = model(images)
-        loss = criterion(output, target)
+#        output = model(images)
+#        loss = criterion(output, target)
 
         # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.append(loss.item())
-        top1.append(acc1[0].cpu())
-        top5.append(acc5[0].cpu())
+#        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+#        losses.append(loss.item())
+#        top1.append(acc1[0].cpu())
+#        top5.append(acc5[0].cpu())
 
-    wandb.log({'val_loss': np.mean(losses)}, step=step)
-    wandb.log({'val_top1': np.mean(top1)}, step=step)
+#    wandb.log({'val_loss': np.mean(losses)}, step=step)
+#    wandb.log({'val_top1': np.mean(top1)}, step=step)
     wandb.log({'val_top5': np.mean(top5)}, step=step)
 
 def accuracy(output, target, topk=(1,)):
