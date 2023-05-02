@@ -71,7 +71,7 @@ def main():
     args = parser.parse_args()
 
     print(args)
-    wandb.init(project="baby-vision", entity="yanlaiy", config=args)
+    wandb.init(project="baby-vision-hyperparameter", entity="peiqiliu", name = "iamgenet-TC")
     wandb.config = args
 
     if args.gpu is not None:
@@ -212,7 +212,7 @@ def main_worker(gpu, ngpus_per_node, args):
         # train for one epoch
         step = train(train_loader, model, criterion, optimizer, epoch, args)
         scheduler.step()
-        wandb.log({'lr': scheduler.get_last_lr()[0]}, step=step)
+        wandb.log({'lr': scheduler.get_last_lr()}, step=step)
         torch.save({'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict()}, 
                     os.path.join(exp_path, f'epoch_{epoch}.tar'))
