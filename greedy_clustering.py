@@ -22,9 +22,8 @@ import torchvision.models as models
 from utils import GaussianBlur
 from torch.utils.data import Subset
 from torch.optim.lr_scheduler import StepLR
-from linear_decoding import AverageMeter, ProgressMeter, load_split_train_test, validate
+from linear_decoding import load_split_train_test, validate
 from linear_decoding import train as val_step
-from sklearn.cluster import KMeans
 from torch.utils.data import DataLoader, Dataset
 
 import time
@@ -69,8 +68,6 @@ parser.add_argument('--augmentation', default=True, action='store_false', help='
 parser.add_argument('--partition', default='SAY', type=str, help='which partition to process. Choices: [S, A, Y, SAY]')
 parser.add_argument('--num-classes', default=26, type=int, help='number of classes in downstream classification task')
 parser.add_argument('--lp_epochs', default=40, type=int, metavar='N', help='number of total epochs to run in linear probing')
-parser.add_argument('--prior_strength', default=10., type=float, metavar='N', help='strength of prior')
-parser.add_argument('--checkpoint_epoch', default=-1, type=int, metavar='N', help='which TC checkpoint you would like to start')
 parser.add_argument('--close_pre_probing', default=True, action='store_false',
                     help='whether to do a linear probing before actually training the network')
 
@@ -82,7 +79,7 @@ def main():
     args = parser.parse_args()
 
     print(args)
-    wandb.init(project="baby-vision-hyperparameter", name = "epoch_" + str(args.checkpoint_epoch) + ", strength_" + str(args.prior_strength) + ", iamgenet", entity="peiqiliu", config=args)
+    wandb.init(project="baby-vision", name = "tc", entity="yanlaiy", config=args)
     wandb.config = args
 
     if args.gpu is not None:
@@ -98,31 +95,20 @@ def main():
         # Since we have ngpus_per_node processes per node, the total world_size needs to be adjusted accordingly
         args.world_size = ngpus_per_node * args.world_size
         # Use torch.multiprocessing.spawn to launch distributed processes: the main_worker process function
-        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
+        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(args,))
     else:
-        # Simply call main_worker function
-        main_worker(args.gpu, ngpus_per_node, args)
+        main_worker(args.gpu, args)
 
 
-def main_worker(gpu, ngpus_per_node, args):
+def main_worker(gpu, args):
     args.gpu = gpu
 
     if args.gpu is not None:
         print("Use GPU: {} for training".format(args.gpu))
 
     print('Model:', args.model)
-    if args.model == 'convnext_tiny':
-        model = models.convnext_tiny()
-    if args.model == 'convnext_large':
-        model = models.convnext_large()
-    else:
-        model = models.__dict__[args.model](pretrained=True)
-    if args.model.startswith('res'):
-        model.fc = torch.nn.Linear(in_features=2048, out_features=args.n_out, bias=True)
-    elif not args.model.startswith('convnext'):
-        model.classifier = torch.nn.Linear(in_features=1280, out_features=args.n_out, bias=True)
-    else:
-        model.classifier.append(torch.nn.Linear(1000, args.n_out))
+    model = models.__dict__[args.model](pretrained=False)
+    model.fc = torch.nn.Linear(in_features=2048, out_features=args.n_out, bias=True)
 
     # DataParallel will divide and allocate batch_size to all available GPUs
     model = torch.nn.DataParallel(model).cuda()
@@ -141,8 +127,6 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     if args.resume:
-        assert args.checkpoint_epoch != 0
-        args.resume = os.path.join(args.resume, "epoch_" + str(args.checkpoint_epoch) + ".tar")
         if os.path.isfile(args.resume):
             print(args.resume)
             checkpoint = torch.load(args.resume)
@@ -154,7 +138,7 @@ def main_worker(gpu, ngpus_per_node, args):
     date_time = datetime.now().strftime("%m%d%Y_%H%M%S")
     
     exp_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'experiments')
-    savefile_dir = f'{args.model}_{args.batch_size}_{args.augmentation}_{args.partition}_{date_time}_{args.checkpoint_epoch}_{args.prior_strength}'
+    savefile_dir = f'{args.model}_{args.batch_size}_{args.augmentation}_{args.partition}_{date_time}'
     exp_path = os.path.join(exp_path, savefile_dir)
     print(exp_path)
     args.exp_path = exp_path
@@ -209,40 +193,24 @@ def main_worker(gpu, ngpus_per_node, args):
             set_parameter_requires_grad(model, True)
         if epoch % args.epochs == 0 or epoch == args.start_epoch:
             start_time = time.time()
-            if args.model.startswith('convnext'):
-                last_layer = model.module.classifier[-1]
-                model.module.classifier[-1] = torch.nn.Identity()
-            elif args.model.startswith('res'):
-                last_layer = model.module.fc
-                model.module.fc = torch.nn.Identity()
-            else:
-                last_layer = model.module.classifier
-                model.module.classifier = torch.nn.Identity()
-            
+            last_layer = model.module.fc
+            model.module.fc = torch.nn.Identity()
+        
             set_parameter_requires_grad(model, False)
             if args.cluster_resume:
                 print("load clusters from " + args.cluster_resume)
                 labels = torch.load(args.cluster_resume)
             else:
                 print("KMeans start")
-                labels = get_labels(kmeans_dataset, 10, model, epoch, last_layer.weight, args)
+                labels = get_labels(kmeans_dataset, model)
                 print("KMeans end")
                 end_time = time.time()
                 print("KMeans takes " + str(- start_time + end_time))
             torch.save(labels, os.path.join(args.exp_path, f'cluster_{epoch}.tar'))
             
-            if args.model.startswith('convnext'):
-                model.module.classifier[-1] = torch.nn.Linear(in_features=1000, out_features=args.n_out, bias=True).cuda()
-                #model.module.classifier[-1] = last_layer
-                rename_optimizer = torch.optim.Adam([model.module.classifier[-1].weight], args.lp_lr, weight_decay=args.weight_decay)
-            elif args.model.startswith('res'):
-                model.module.fc = torch.nn.Linear(in_features=2048, out_features=args.n_out, bias=True).cuda()
-                #model.module.fc = last_layer
-                rename_optimizer = torch.optim.Adam([model.module.fc.weight], args.lp_lr, weight_decay=args.weight_decay)
-            else:
-                model.module.classifier = torch.nn.Linear(in_features=1280, out_features=args.n_out, bias=True).cuda()
-                #model.module.classifier = last_layer
-                rename_optimizer = torch.optim.Adam([model.module.classifier.weight], args.lp_lr, weight_decay=args.weight_decay)
+            model.module.fc = torch.nn.Linear(in_features=2048, out_features=args.n_out, bias=True).cuda()
+            #model.module.fc = last_layer
+            rename_optimizer = torch.optim.Adam([model.module.fc.weight], args.lp_lr, weight_decay=args.weight_decay)
             #set_parameter_requires_grad(model, True)
     
         train_loader = torch.utils.data.DataLoader(
@@ -263,76 +231,106 @@ def main_worker(gpu, ngpus_per_node, args):
             torch.save({'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict()}, 
                     os.path.join(exp_path, f'epoch_{epoch}.tar'))
-        #step = train(train_loader, model, criterion, optimizer, epoch, args)
-        #scheduler.step()
-        #torch.save({'model_state_dict': model.state_dict(),
-        #    'optimizer_state_dict': optimizer.state_dict()}, 
-        #    os.path.join(exp_path, f'epoch_{epoch}.tar'))
+            
+def cluster_loss(embs):
+    embs_mean = torch.mean(embs, dim=0)
+    return torch.sum((embs - embs_mean) ** 2)
 
-def KMeans(X, num_clusters = 10, max_iter = 100, centroids = None):
-    # Initialize cluster centroids randomly
-    if centroids is None:
-        centroids = X[torch.randperm(X.shape[0])[:num_clusters]]
+def total_cluster_loss(embs, changepoint):
+    cls1 = embs[:changepoint]
+    cls2 = embs[changepoint:]
+    return cluster_loss(cls1) + cluster_loss(cls2)
 
-    # Loop until convergence or maximum iterations reached
-    for i in range(max_iter):
-        # Compute distances between each point and each centroid
-        distances = torch.cdist(X, centroids)
+def temporal_cluster(embs):
+    losses = []
+    for changepoint in range(1, len(embs) - 1):
+        losses.append(total_cluster_loss(embs, changepoint))
+    losses = torch.tensor(losses)
+    best_changepoint = torch.argmin(losses)
+
+    return best_changepoint
+
+# def cluster_loss(embs):
+#     # Compute cumulative sum and square sum
+#     cumsum = torch.cumsum(embs, dim=0)
+#     cumsum_sq = torch.cumsum(embs ** 2, dim=0)
+#     # Compute number of elements in each cluster
+#     n = torch.arange(1, len(embs) + 1).view(-1, 1).to('cuda')
+#     # Compute the mean in a cumulative way
+#     mean = cumsum / n
+#     # Compute the loss in a cumulative way
+#     loss = cumsum_sq - 2 * mean * cumsum + n * mean ** 2
+#     return loss
+
+# def total_cluster_loss(embs):
+#     cls_loss_forward = cluster_loss(embs)
+#     cls_loss_backward = cluster_loss(torch.flip(embs, dims=[0]))
+#     # Compute the total loss for each potential changepoint
+#     total_loss = cls_loss_forward[:-1] + torch.flip(cls_loss_backward[:-1], dims=[0])
+#     return total_loss
+
+# def temporal_cluster(embs):
+#     losses = total_cluster_loss(embs)
+#     best_changepoint = torch.argmin(losses)
     
-        # Assign each point to the closest centroid
-        cluster_labels = torch.argmin(distances, dim=1)
-        # Update cluster centroids
-        for j in range(num_clusters):
-            mask = cluster_labels == j
-            if mask.any():
-                centroids[j] = X[mask].mean(dim=0)
-    return cluster_labels
+#     return best_changepoint
     
-def get_prior(target, n, beta):
-    entropy = torch.roll(1 - 0.2 * torch.abs(torch.linspace(0, n - 1, n) - ((n - 1) // 2)), -((n -1) // 2))
-    return torch.stack([torch.softmax(beta * torch.roll(entropy, label.item()), -1) for label in target])
-    
-def get_labels(train_dataset, group_size, model, epoch, centroids, args):
-    device =torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def get_labels(train_dataset, model):
+    device = torch.device('cuda')
     labels = torch.tensor(list(train_dataset.class_to_idx.values()))
     targets = torch.tensor(())
-    last_time = time.time()
     model.eval()
-    for group in range(int(np.ceil(len(labels) / group_size))):
-        if group % (100 // group_size) == 0:
-            print(group, time.time() - last_time)
-            last_time = time.time()
-        start = time.time()
-        group_labels = labels[torch.linspace(group * group_size, (group + 1) * group_size - 1, group_size).long()]
-        class_to_idx = {k: v for (k, v) in train_dataset.class_to_idx.items() if v in group_labels}
-        train_idx = [i for i in range(len(train_dataset.dataset)) if train_dataset.dataset.imgs[i][1] in class_to_idx.values()]
-        one_train_dataset = Subset(train_dataset.dataset, train_idx)
-        train_loader = torch.utils.data.DataLoader(
-            one_train_dataset, batch_size=128, shuffle=False, pin_memory=True)
+    print(len(labels))
+
+    # t1 = time.time()
+    all_train_idxs = []
+    for group_label in range(len(labels)):
+         all_train_idxs.append([])
+    for i in range(len(train_dataset.dataset)):
+        if train_dataset.dataset.imgs[i][1] < len(all_train_idxs):
+            all_train_idxs[train_dataset.dataset.imgs[i][1]].append(i)
+    # t2 = time.time()
+    # print("Time 1", t2-t1)
+
+    for group_label in range(len(labels)):
+        if group_label % 50 == 0:
+            print(group_label)
+        # t2 = time.time()
+        one_train_dataset = Subset(train_dataset.dataset, all_train_idxs[group_label])
+        # t3 = time.time()
+        train_loader = torch.utils.data.DataLoader(one_train_dataset, batch_size=128, shuffle=False, pin_memory=True)
+        # t4 = time.time()
         rep = []
         for idx, (images, tc_label) in enumerate(train_loader):
             with torch.no_grad():
                 output = model(images.to(device))
             output = (output.permute(1, 0) / torch.linalg.norm(output, dim = -1)).permute(1, 0) # (batch_size, feature_dim)
-            
-            # Hyperparameter
-            prior = get_prior(tc_label - group * group_size, group_size, args.prior_strength).cuda(args.gpu, non_blocking=True)
-            output = torch.cat((output, prior), -1)
-            rep.append(output) 
+            rep.append(output)
+        # t5 = time.time()
         rep = torch.vstack(rep) # (batch_size, feature_dim)
-        group_centroids = centroids[torch.linspace(group * group_size, (group + 1) * group_size - 1, group_size).long()]
-        #group_centroids = centroids[torch.linspace(group * group_size, (group + 1) * group_size - 1, group_size // 2).long()]
-        num_clusters = np.min(((group + 1) * group_size, len(labels))) - group * group_size
-        #num_clusters = num_clusters // 2
-        group_centroids = (group_centroids.permute(1, 0) / torch.linalg.norm(group_centroids, dim = -1)).permute(1, 0)
-        group_centroids = torch.hstack((group_centroids, torch.eye(num_clusters, group_size).to(device)))
-        #print(num_clusters)
-        cur_targets = KMeans(rep, num_clusters, centroids = group_centroids).cpu()
-        #cur_targets = KMeans(rep, num_clusters * 2).cpu()
-        #print(torch.unique(cur_targets))
-        #targets = torch.concatenate((targets, cur_targets + group * group_size * 2))
-        #targets = torch.concatenate((targets, cur_targets + group * group_size // 2))
-        targets = torch.cat((targets, cur_targets + group * group_size))
+        # t6 = time.time()
+        # print("Time 3", t3-t2)
+        # print("Time 3", t4-t3)
+        # print("Time 4", t5-t4)
+        # print("Time 5", t6-t5)
+    
+        if group_label == 0:
+            # First iteration
+            emb1 = None
+            emb2 = rep
+        else:
+            emb1 = emb2
+            emb2 = rep
+            # import pdb; pdb.set_trace()
+            emb = torch.cat((emb1, emb2), dim=0) # Check the dim
+            best_changepoint = temporal_cluster(rep)
+            emb2 = emb[best_changepoint:]
+            curr_targets = torch.full((best_changepoint, ), group_label - 1).cpu()
+            targets = torch.cat((targets, curr_targets))
+            if group_label == len(labels) - 1:
+                # Last iteration
+                curr_targets = torch.full((len(emb2), ), group_label).cpu()
+                targets = torch.cat((targets, curr_targets))
     return targets.long()
 
 class ModifiedSubset(Dataset):
