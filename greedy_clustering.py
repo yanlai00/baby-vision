@@ -44,9 +44,9 @@ parser.add_argument('-b', '--batch-size', default=64, type=int, metavar='N',
                     help='mini-batch size (default: 64), this is the total batch size of all GPUs on the current node '
                          'when using Data Parallel or Distributed Data Parallel')
 parser.add_argument('--optim', default='sgd', type=str, help='optimizer, Choices: ["adam", "sgd"]')
-parser.add_argument('--lr', '--learning-rate', default=0.0001, type=float, metavar='LR', help='initial learning rate',
+parser.add_argument('--lr', '--learning-rate', default=0.1, type=float, metavar='LR', help='initial learning rate',
                     dest='lr')
-parser.add_argument('--lp_lr', '--lp_learning-rate', default=0.0006, type=float, help='initial learning ratefor downstream task')
+parser.add_argument('--lp_lr', '--lp_learning-rate', default=0.0005, type=float, help='initial learning ratefor downstream task')
 parser.add_argument('--wd', '--weight-decay', default=0.0, type=float, metavar='W', help='weight decay (default: 0)',
                     dest='weight_decay')
 parser.add_argument('-p', '--print-freq', default=1000, type=int, metavar='N', help='print frequency (default: 1000)')
@@ -249,31 +249,6 @@ def temporal_cluster(embs):
     best_changepoint = torch.argmin(losses)
 
     return best_changepoint
-
-# def cluster_loss(embs):
-#     # Compute cumulative sum and square sum
-#     cumsum = torch.cumsum(embs, dim=0)
-#     cumsum_sq = torch.cumsum(embs ** 2, dim=0)
-#     # Compute number of elements in each cluster
-#     n = torch.arange(1, len(embs) + 1).view(-1, 1).to('cuda')
-#     # Compute the mean in a cumulative way
-#     mean = cumsum / n
-#     # Compute the loss in a cumulative way
-#     loss = cumsum_sq - 2 * mean * cumsum + n * mean ** 2
-#     return loss
-
-# def total_cluster_loss(embs):
-#     cls_loss_forward = cluster_loss(embs)
-#     cls_loss_backward = cluster_loss(torch.flip(embs, dims=[0]))
-#     # Compute the total loss for each potential changepoint
-#     total_loss = cls_loss_forward[:-1] + torch.flip(cls_loss_backward[:-1], dims=[0])
-#     return total_loss
-
-# def temporal_cluster(embs):
-#     losses = total_cluster_loss(embs)
-#     best_changepoint = torch.argmin(losses)
-    
-#     return best_changepoint
     
 def get_labels(train_dataset, model):
     device = torch.device('cuda')
@@ -282,37 +257,25 @@ def get_labels(train_dataset, model):
     model.eval()
     print(len(labels))
 
-    # t1 = time.time()
     all_train_idxs = []
     for group_label in range(len(labels)):
          all_train_idxs.append([])
     for i in range(len(train_dataset.dataset)):
         if train_dataset.dataset.imgs[i][1] < len(all_train_idxs):
             all_train_idxs[train_dataset.dataset.imgs[i][1]].append(i)
-    # t2 = time.time()
-    # print("Time 1", t2-t1)
 
     for group_label in range(len(labels)):
         if group_label % 50 == 0:
             print(group_label)
-        # t2 = time.time()
         one_train_dataset = Subset(train_dataset.dataset, all_train_idxs[group_label])
-        # t3 = time.time()
         train_loader = torch.utils.data.DataLoader(one_train_dataset, batch_size=128, shuffle=False, pin_memory=True)
-        # t4 = time.time()
         rep = []
         for idx, (images, tc_label) in enumerate(train_loader):
             with torch.no_grad():
                 output = model(images.to(device))
             output = (output.permute(1, 0) / torch.linalg.norm(output, dim = -1)).permute(1, 0) # (batch_size, feature_dim)
             rep.append(output)
-        # t5 = time.time()
         rep = torch.vstack(rep) # (batch_size, feature_dim)
-        # t6 = time.time()
-        # print("Time 3", t3-t2)
-        # print("Time 3", t4-t3)
-        # print("Time 4", t5-t4)
-        # print("Time 5", t6-t5)
     
         if group_label == 0:
             # First iteration
@@ -384,22 +347,13 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
 def val(val_dir, model, criterion, step, args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if args.model.startswith('res'):
-        last_layer = model.module.fc
-        model.module.fc = torch.nn.Linear(2048, args.num_classes).to(device)
-        optimizer = torch.optim.Adam([model.module.fc.weight], args.lp_lr, weight_decay=args.weight_decay)
-    elif not args.model.startswith('convnext'):
-        last_layer = model.module.classifier
-        model.module.classifier = torch.nn.Linear(1280, args.num_classes).to(device)
-        optimizer = torch.optim.Adam([model.module.classifier.weight], args.lp_lr, weight_decay=args.weight_decay)
-    else:
-        last_layer = model.module.classifier[-1]
-        model.module.classifier[-1] = torch.nn.Linear(1000, args.num_classes).to(device)
-        optimizer = torch.optim.Adam([model.module.classifier[-1].weight], args.lp_lr, momentum = 0.9, weight_decay=args.weight_decay)
+    last_layer = model.module.fc
+    model.module.fc = torch.nn.Linear(2048, args.num_classes).to(device)
+    optimizer = torch.optim.Adam([model.module.fc.weight], args.lp_lr, weight_decay=args.weight_decay)
     args.subsample = False
     val_train, val_test = load_split_train_test(val_dir, args)
     for epoch in range(args.lp_epochs):
-        top1 = val_step(val_train, model, criterion, optimizer, epoch, args)
+        train_top1 = val_step(val_train, model, criterion, optimizer, epoch, args)
     val_top1 = validate(val_test, model, args)[0]
     wandb.log({'val_top1': val_top1}, step=step)
     if args.model.startswith('res'):
